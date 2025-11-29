@@ -43,7 +43,7 @@ comment on column stg.agg_sales.report_period  is 'Начало месяца з�
 update stg.agg_sales set report_period = '2025-11-01'::date;
 commit;
 
-
+ 
 
 --серебряный слой
 drop schema dds cascade;
@@ -159,20 +159,24 @@ create table if not exists dds.sat_sales_agg_metrics(
     hk_lnk_sales_agg bytea not null,
     hash_diff bytea not null,
     sub_id integer not null,
+    valid_from timestamptz not null,
+    valid_to timestamptz,
+    is_active boolean not null default true,
     s_load_dts timestamptz not null,
     s_load_source varchar(100) not null,
-    constraint hk_sat_sales_agg_metrics primary key (hk_lnk_sales_agg, s_load_dts, sub_id)
-)
-partition by range(s_load_dts);
--- партиционирование нужно, для:
---      быстрой очистки устаревших данных - мгновенно освобождается место удаленной партиции
---      быстрого обновления индексов btree, т.к. индексы в постгрессе всегда локальные, если не партиционировать, 
---      то придется обновлять индексы по всей таблице
+    constraint pk_sat_sales_metrics primary key (hk_lnk_sales_agg, sub_id, valid_from)    
+);
 
-comment on table dds.sat_sales_agg_metrics is 'Метрики продаж';
+comment on table dds.sat_sales_agg_metrics is 
+'Метрики продаж, сателлит типа Multi-Active Satellite, у которого несколько несколько активных строк для одного ключа ';
+comment on column dds.sat_sales_agg_metrics.sub_id is 
+'Идентификатор под-записи для поддержки Multi-Active Satellite (несколько активных строк на один ключ Линка)';
 
--- индекс для оконок с сортировкой по sub_id desc
-create index idx_sat_sales_agg_metrics_s_load_dts on dds.sat_sales_agg_metrics(sub_id);
+-- индекс для активных строк
+create index idx_sat_sales_agg_metrics_active on dds.sat_sales_agg_metrics(hk_lnk_sales_agg, sub_id) where is_active = true;
+
+-- индекс для поиска в истории (time travel)
+create index idx_sat_sales_agg_metrics_history on dds.sat_sales_agg_metrics(hk_lnk_sales_agg, valid_from, valid_to);
 
 --select * from dds.sat_sales_agg_metrics
 
@@ -287,31 +291,20 @@ on conflict (hk_lnk_sales_agg) do nothing; -- обеспечит идемпот�
 --commit;
 
 
---Multi-active satellite
---добавляем партиции
-DO $$
-DECLARE
-    r RECORD;
-    v_schema_name text := 'dds';
-    v_table_name  text := 'sat_sales_agg_metrics';
-    v_part_name   text;
-    v_start_date  date := date_trunc('month', now())::date;
-    v_end_date    date := v_start_date + interval '1 month';
-BEGIN
-        v_part_name := v_table_name || '_y' || to_char(v_start_date, 'YYYY') || 'm' || to_char(v_start_date, 'MM');
-        -- %I - для имен идентификаторов (защита от инъекций), %L - для литералов значений
-        EXECUTE format('create table if not exists %I.%I partition of %I.%I 
-                        for values from (%L) to (%L)',
-            v_schema_name, v_part_name,  -- имя новой партиции
-            v_schema_name, v_table_name, -- имя родителя
-            v_start_date, v_end_date     -- границы
-        );
-        
-        RAISE NOTICE 'Обработана партиция: %.% (интервал % - %)', v_schema_name, v_part_name, v_start_date, v_end_date;
-END $$;
-
-
 --truncate table dds.sat_sales_agg_metrics
+--закрываем имеющиеся строки по ключу 
+update dds.sat_sales_agg_metrics
+set valid_to = now(), is_active = false
+from stg.agg_sales
+where hk_lnk_sales_agg  = 
+        decode(md5(
+            md5(country || '~' || region || '~' || state || '~' || city || '~' || postal_code) || '~' ||
+            md5(category    || '~' || sub_category) || '~' ||
+            md5(segment)    || '~' ||
+            md5(ship_mode)  || '~' ||
+            md5(to_char(report_period, 'YYYY-MM-DD'))), 'hex');
+
+
 insert into dds.sat_sales_agg_metrics(
     sales,
     quantity,
@@ -320,6 +313,9 @@ insert into dds.sat_sales_agg_metrics(
     hk_lnk_sales_agg,
     hash_diff,
     sub_id,
+    valid_from,
+    valid_to,
+    is_active,
     s_load_dts,
     s_load_source    
 )
@@ -359,7 +355,10 @@ select
     profit,
     hk_lnk_sales_agg,
     hash_diff,
-    sub_id,         
+    sub_id,
+    now() as valid_from,
+    '9999-12-31 23:59:59'::timestamptz as valid_to,
+    true as is_active,
     NOW(),
     'SRC1'
 from src 
@@ -420,22 +419,6 @@ insert into cdm.profit(
     sales, 
     amount_discount
 )
-    with ag_metrics as (
-        select
-            hk_lnk_sales_agg,
-            sales,
-            profit,
-            discount
-        from (
-            select 
-                hk_lnk_sales_agg,
-                sales,
-                profit,
-                discount,
-                row_number() over (partition by hk_lnk_sales_agg, sub_id order by s_load_dts desc) as rn
-            from dds.sat_sales_agg_metrics
-        ) where rn = 1
-    )
     select
         c.report_period,
         hs.postal_code,
@@ -453,7 +436,7 @@ insert into cdm.profit(
         left join dds.hub_product_category hsc on hsc.hk_product_category = ag.hk_product_category
         left join dds.hub_calendar c on c.hk_calendar = ag.hk_calendar
         left join dds.hub_ship_mode sd on sd.hk_ship_mode = ag.hk_ship_mode
-        inner join ag_metrics m on m.hk_lnk_sales_agg = ag.hk_lnk_sales_agg
+        inner join dds.sat_sales_agg_metrics m on m.hk_lnk_sales_agg = ag.hk_lnk_sales_agg and m.is_active = true
     group by 
         c.report_period,
         hs.postal_code,
